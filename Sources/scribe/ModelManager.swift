@@ -63,7 +63,10 @@ enum ModelManager {
 
     /// Resolve a model to a local file path, downloading known models that are missing.
     /// Prompts for confirmation when stdin is a terminal.
-    static func ensureModel(_ nameOrPath: String) async throws -> String {
+    ///
+    /// - Parameter isCancelled: polled while downloading, so Ctrl+C ends a fetch that would
+    ///   otherwise have to be waited out. Throws `RunAborted` when it says so.
+    static func ensureModel(_ nameOrPath: String, isCancelled: (@Sendable () -> Bool)? = nil) async throws -> String {
         let path = resolveModelPath(nameOrPath)
         if FileManager.default.fileExists(atPath: path) {
             return path
@@ -84,14 +87,16 @@ enum ModelManager {
             Log.status("Model '\(nameOrPath)' is not downloaded (\(size)). Downloading...")
         }
 
-        try await download(name: nameOrPath, url: url)
+        try await download(name: nameOrPath, url: url, isCancelled: isCancelled)
         return path
     }
 
     // MARK: - Download
 
     /// Download a model from the given URL and save it to the models directory.
-    static func download(name: String, url: URL) async throws {
+    ///
+    /// - Parameter isCancelled: see `ensureModel(_:isCancelled:)`.
+    static func download(name: String, url: URL, isCancelled: (@Sendable () -> Bool)? = nil) async throws {
         let fm = FileManager.default
         let modelsDir = ScribeConfig.modelsDir
 
@@ -127,6 +132,14 @@ enum ModelManager {
         for try await byte in bytes {
             buffer.append(byte)
             if buffer.count >= bufferSize {
+                // Checked per buffer rather than per byte: still well inside a second, and a
+                // multi-gigabyte fetch is the longest thing Ctrl+C has to get out of.
+                if isCancelled?() == true {
+                    eprintln("")
+                    try? fm.removeItem(atPath: tempPath)
+                    throw RunAborted()
+                }
+
                 fileHandle.write(buffer)
                 downloadedBytes += Int64(buffer.count)
                 buffer.removeAll(keepingCapacity: true)

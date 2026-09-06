@@ -22,6 +22,9 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
     private let paths: RecordingPaths
 
+    /// Guards everything below, and decides which of start and stop got there first.
+    private let lifecycle = CaptureLifecycle()
+
     // ScreenCaptureKit — system audio only
     private var stream: SCStream?
     private var systemRecorder: SourceRecorder?
@@ -31,8 +34,6 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     // AVAudioEngine — microphone
     private var audioEngine: AVAudioEngine?
     private var micRecorder: SourceRecorder?
-
-    private var continuation: CheckedContinuation<Void, any Error>?
 
     init(captureMic: Bool = true, captureSystem: Bool = true, paths: RecordingPaths) {
         self.captureMic = captureMic
@@ -45,62 +46,87 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
     /// Start capturing audio. Suspends until stopCapture() is called.
     ///
+    /// Returns without suspending when the session was stopped before every source was live:
+    /// stopCapture() would have nothing to resume, and this would wait out the whole run.
+    ///
     /// - Parameter onStarted: called once every requested source is live, so the caller
     ///   only claims to be recording after setup actually succeeded.
     func startCapture(onStarted: () -> Void = {}) async throws {
         Log.info("Starting audio capture (mic: \(captureMic), system: \(captureSystem))")
 
-        if captureMic {
-            try startMicrophoneCapture()
+        // Stopped before this ran, or started once already: either way, nothing to bring up.
+        guard lifecycle.beginStartup() else { return }
+
+        do {
+            if captureMic {
+                try startMicrophoneCapture()
+            }
+            // Skipped after a stop rather than waited out: ScreenCaptureKit takes its time.
+            if captureSystem, !lifecycle.isStopped {
+                try await startSystemAudioCapture()
+            }
+        } catch {
+            // A stop landing mid-startup is reason enough for this failure, and the caller
+            // already has the reason it ended the session with.
+            if lifecycle.isStopped { return }
+            throw error
         }
 
-        if captureSystem {
-            try await startSystemAudioCapture()
+        if lifecycle.beginRunning() {
+            onStarted()
         }
 
-        onStarted()
-
-        // Suspend until stopCapture() resumes the continuation
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-            self.continuation = cont
-        }
+        // Suspend until stopCapture() ends the session.
+        try await lifecycle.waitForStop()
     }
 
     /// Stop capturing and close the per-source recordings.
+    ///
+    /// Safe before or during startup: whatever is not handed over by then is torn down by the
+    /// startup itself, and a later call finds the session already over.
     func stopCapture() -> CaptureResult {
-        Log.info("Stopping audio capture...")
+        var engine: AVAudioEngine?
+        var captureStream: SCStream?
+        var mic: SourceRecorder?
+        var system: SourceRecorder?
 
-        // Stop microphone (AVAudioEngine)
-        if let engine = self.audioEngine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+        let stopped = lifecycle.stop {
+            engine = self.audioEngine
+            captureStream = self.stream
+            mic = self.micRecorder
+            system = self.systemRecorder
+            self.audioEngine = nil
+            self.stream = nil
+            self.micRecorder = nil
+            self.systemRecorder = nil
         }
-        self.audioEngine = nil
+        guard stopped else { return CaptureResult(mic: nil, system: nil) }
 
-        // Stop system audio stream (ScreenCaptureKit)
-        if let stream = self.stream {
-            // Fire and forget the async stop - samples are already captured
-            let streamToStop = stream
-            Task { @Sendable in
-                do {
-                    try await streamToStop.stopCapture()
-                } catch {
-                    Log.warning("Error stopping stream: \(error.localizedDescription)")
-                }
+        Log.info("Stopping audio capture...")
+        Self.tearDown(engine: engine)
+        Self.tearDown(stream: captureStream)
+
+        return CaptureResult(mic: mic?.finish(), system: system?.finish())
+    }
+
+    // MARK: - Teardown
+
+    private static func tearDown(engine: AVAudioEngine?) {
+        guard let engine else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+    }
+
+    private static func tearDown(stream: SCStream?) {
+        guard let stream else { return }
+        // Fire and forget the async stop - samples are already captured
+        Task { @Sendable in
+            do {
+                try await stream.stopCapture()
+            } catch {
+                Log.warning("Error stopping stream: \(error.localizedDescription)")
             }
         }
-        self.stream = nil
-
-        // Resume the continuation so startCapture() returns
-        continuation?.resume()
-        continuation = nil
-
-        let mic = micRecorder?.finish()
-        let system = systemRecorder?.finish()
-        micRecorder = nil
-        systemRecorder = nil
-
-        return CaptureResult(mic: mic, system: system)
     }
 
     // MARK: - Microphone (AVAudioEngine)
@@ -123,7 +149,6 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             sampleRate: format.sampleRate,
             channels: channelCount
         )
-        self.micRecorder = recorder
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, time in
             self?.handleMicBuffer(buffer, at: time)
@@ -136,12 +161,22 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         } catch {
             inputNode.removeTap(onBus: 0)
             recorder.discard()
-            self.micRecorder = nil
             handleMicrophonePermissionError(error)
             throw error
         }
 
-        self.audioEngine = engine
+        // Handed over together: the tap looks the recorder up here, and a stop that already
+        // landed leaves both of them to be taken back down.
+        let handedOver = lifecycle.publish {
+            self.audioEngine = engine
+            self.micRecorder = recorder
+        }
+        guard handedOver else {
+            Self.tearDown(engine: engine)
+            recorder.discard()
+            return
+        }
+
         Log.info("Microphone capture started (AVAudioEngine)")
     }
 
@@ -167,7 +202,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         }
 
         let startSeconds = time.isHostTimeValid ? AVAudioTime.seconds(forHostTime: time.hostTime) : nil
-        micRecorder?.append(samples, startingAt: startSeconds)
+        // Nil once stopped, so a buffer still in flight isn't appended to a closed recording.
+        lifecycle.withSession { micRecorder }?.append(samples, startingAt: startSeconds)
     }
 
     // MARK: - System Audio (ScreenCaptureKit)
@@ -210,10 +246,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             sampleRate: sourceSampleRate,
             channels: Int(config.channelCount)
         )
-        self.systemRecorder = recorder
 
         let captureStream = SCStream(filter: filter, configuration: config, delegate: self)
-        self.stream = captureStream
 
         let queue = DispatchQueue(label: "com.scribe.audio-capture", qos: .userInitiated)
         do {
@@ -221,11 +255,21 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             Log.debug("Added system audio output")
             try await captureStream.startCapture()
         } catch {
-            self.stream = nil
             recorder.discard()
-            self.systemRecorder = nil
             handlePermissionError(error)
             throw error
+        }
+
+        // Handed over only once the stream is live, so a stop can never be handed one it
+        // cannot stop yet. The first buffers arrive a frame later, not in between.
+        let handedOver = lifecycle.publish {
+            self.stream = captureStream
+            self.systemRecorder = recorder
+        }
+        guard handedOver else {
+            Self.tearDown(stream: captureStream)
+            recorder.discard()
+            return
         }
 
         Log.info("System audio capture started (ScreenCaptureKit)")
@@ -254,7 +298,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         let startSeconds = pts.isValid
             ? AVAudioTime.seconds(forHostTime: CMClockConvertHostTimeToSystemUnits(pts))
             : nil
-        systemRecorder?.append(samples, startingAt: startSeconds)
+        // Nil once stopped, so a buffer still in flight isn't appended to a closed recording.
+        lifecycle.withSession { systemRecorder }?.append(samples, startingAt: startSeconds)
     }
 
     // MARK: - SCStreamDelegate
@@ -262,8 +307,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
         Log.error("Stream stopped with error: \(error.localizedDescription)")
         handlePermissionError(error)
-        continuation?.resume(throwing: error)
-        continuation = nil
+        lifecycle.fail(error)
     }
 
     // MARK: - Private

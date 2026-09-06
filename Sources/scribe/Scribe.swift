@@ -21,6 +21,9 @@ struct Scribe: AsyncParsableCommand {
             then transcribe with a local whisper model. \
             Run without a subcommand to record and transcribe in one step; \
             the recording is deleted once the transcript is written, unless you pass --keep-audio or -w.
+
+            While recording, press q and confirm with y to stop and move on to the transcript. \
+            Ctrl+C ends the whole run at any point, keeping the audio and the transcript written so far.
             """,
         version: "0.2.1",
         subcommands: [
@@ -92,12 +95,18 @@ extension Scribe {
             _ = try await ModelManager.ensureModel(config.model)
 
             // Record
-            let recording = try await performRecording(
-                captureMic: !config.noMic,
-                captureSystem: !config.noSystem,
-                wavPath: wavPath,
-                config: config
-            )
+            let recording: RecordingResult
+            do {
+                recording = try await performRecording(
+                    captureMic: !config.noMic,
+                    captureSystem: !config.noSystem,
+                    wavPath: wavPath,
+                    config: config
+                )
+            } catch is RunAborted {
+                // performRecording already said where the audio ended up.
+                throw ExitCode.interrupted
+            }
 
             guard !recording.samples.isEmpty else {
                 throw ScribeError.noAudioCaptured
@@ -107,12 +116,21 @@ extension Scribe {
             let writer = try TranscriptWriter(path: output, format: config.format)
             defer { writer.close() }
 
-            try await performTranscription(
-                samples: recording.samples,
-                config: config,
-                showProgress: !writer.isStdout,
-                onSegment: writer.write
-            )
+            do {
+                try await performTranscription(
+                    samples: recording.samples,
+                    config: config,
+                    showProgress: !writer.isStdout,
+                    onSegment: writer.write
+                )
+            } catch is RunAborted {
+                // The transcript is incomplete, so the audio it came from stays regardless
+                // of --keep-audio: rerunning is the only way to finish it.
+                if let wav = recording.wavPath {
+                    Log.status("Recording kept at: \(wav) (\(recording.spanDescription))")
+                }
+                throw ExitCode.interrupted
+            }
 
             if let wav = recording.wavPath {
                 let deleted = try disposeRecording(at: wav, userSpecifiedWavPath: wavPath, keepAudio: keepAudio)
@@ -131,7 +149,11 @@ extension Scribe {
 extension Scribe {
     struct Record: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Record audio and save as WAV (no transcription). The WAV is always kept."
+            abstract: "Record audio and save as WAV (no transcription). The WAV is always kept.",
+            discussion: """
+                Press q and confirm with y to stop the recording. \
+                Ctrl+C ends the run instead, keeping whatever was captured before it.
+                """
         )
 
         @OptionGroup var global: GlobalOptions
@@ -148,12 +170,18 @@ extension Scribe {
         mutating func run() async throws {
             let config = try resolveConfig(global: global, noMic: noMic, noSystem: noSystem)
 
-            let recording = try await performRecording(
-                captureMic: !config.noMic,
-                captureSystem: !config.noSystem,
-                wavPath: output,
-                config: config
-            )
+            let recording: RecordingResult
+            do {
+                recording = try await performRecording(
+                    captureMic: !config.noMic,
+                    captureSystem: !config.noSystem,
+                    wavPath: output,
+                    config: config
+                )
+            } catch is RunAborted {
+                // performRecording already said where the audio ended up.
+                throw ExitCode.interrupted
+            }
 
             if let wav = recording.wavPath {
                 Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
@@ -247,12 +275,16 @@ extension Scribe {
 
             // Timestamps stay on the source file's clock, so subtitles from a slice still line up.
             let offset = start
-            try await performTranscription(
-                samples: samples,
-                config: config,
-                showProgress: !writer.isStdout,
-                onSegment: { writer.write(segment: $0.shifted(by: offset)) }
-            )
+            do {
+                try await performTranscription(
+                    samples: samples,
+                    config: config,
+                    showProgress: !writer.isStdout,
+                    onSegment: { writer.write(segment: $0.shifted(by: offset)) }
+                )
+            } catch is RunAborted {
+                throw ExitCode.interrupted
+            }
         }
     }
 }
@@ -484,17 +516,22 @@ private func performRecording(
 
     let stopSignal = StopSignal()
 
-    // Set up SIGINT handler for graceful stop
-    let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    signal(SIGINT, SIG_IGN) // Ignore default SIGINT handling
-    sigintSource.setEventHandler { stopSignal.signal(.interrupted) }
-    sigintSource.resume()
+    // Ctrl+C ends the whole run, not just the recording. Taken over before the terminal
+    // is: a SIGINT arriving in between would kill the process on its default action and
+    // leave the terminal in single-key mode for whatever the user ran next.
+    let interrupts = InterruptGuard { stopSignal.signal(.aborted) }
+    defer { interrupts.release() } // declared first, so it runs after the console's
+
+    // Claim the terminal before anything is captured: without one there is no stop key,
+    // and finding that out an hour into a recording is too late to be useful.
+    let console = try StopConsole(stopSignal: stopSignal)
+    defer { console.stop() } // whatever happens below, the terminal goes back
 
     // Start capture in background
     let captureTask = Task {
         do {
             try await capture.startCapture {
-                Log.status("Recording... Press Ctrl+C to stop.")
+                Log.status(StopConsole.recordingHint)
             }
         } catch {
             // startCapture only throws while setting up, so this never races a real recording.
@@ -502,43 +539,68 @@ private func performRecording(
         }
     }
 
-    // Wait for SIGINT, or for capture to give up before it ever started
+    // Wait for the stop key, for Ctrl+C, or for capture to give up before it ever started
     let reason = await stopSignal.wait()
 
-    sigintSource.cancel()
-    signal(SIGINT, SIG_DFL)
+    // Terminal first, then Ctrl+C: the moment SIGINT can kill the process again, the
+    // terminal has to already be back to normal. Both are idempotent, so the defers
+    // above cover the paths that never reach this.
+    console.stop()
+    interrupts.release()
 
     if case .failed(let error) = reason {
         captureTask.cancel()
-        for source in capture.stopCapture().sources {
-            Log.status("  Source recording kept: \(source.path)")
-        }
+        reportKeptSources(capture.stopCapture().sources)
         throw error
     }
 
     // Stop capture and close the per-source recordings
-    Log.status("") // newline after ^C
+    Log.status("") // separate the recording prompts from what comes next
     let result = capture.stopCapture()
     let endedAt = Date()
 
     // Cancel capture task
     captureTask.cancel()
 
+    let samples: [Float]
     do {
-        let samples = try RecordingFinalizer.finalize(result, to: paths.output)
-        return RecordingResult(
-            samples: samples,
-            wavPath: samples.isEmpty ? nil : paths.output,
-            startedAt: startedAt,
-            endedAt: endedAt
-        )
+        samples = try RecordingFinalizer.finalize(result, to: paths.output)
     } catch {
         Log.error("Failed to write \(paths.output): \(error.localizedDescription)")
-        for source in result.sources {
-            Log.status("  Source recording kept: \(source.path)")
-        }
+        reportKeptSources(result.sources)
         throw error
     }
+
+    let recording = RecordingResult(
+        samples: samples,
+        wavPath: samples.isEmpty ? nil : paths.output,
+        startedAt: startedAt,
+        endedAt: endedAt
+    )
+
+    // Ctrl+C ends the run here, but the audio captured up to it is still worth keeping.
+    if case .aborted = reason {
+        throw reportAbortedRecording(recording)
+    }
+
+    return recording
+}
+
+/// Report the per-source recordings left behind when the mixed WAV never happened.
+private func reportKeptSources(_ sources: [CapturedSource]) {
+    for source in sources {
+        Log.status("  Source recording kept: \(source.path)")
+    }
+}
+
+/// Say where an aborted recording ended up, then hand the abort to the command that can exit.
+private func reportAbortedRecording(_ recording: RecordingResult) -> RunAborted {
+    if let wav = recording.wavPath {
+        Log.status("Aborted. Recording kept at: \(wav) (\(recording.spanDescription))")
+    } else {
+        Log.status("Aborted before anything was recorded.")
+    }
+    return RunAborted()
 }
 
 /// Transcribe audio samples using whisper.cpp and forward each decoded segment immediately.
@@ -550,30 +612,70 @@ private func performTranscription(
     showProgress: Bool,
     onSegment: @escaping (TranscriptSegment) -> Void
 ) async throws -> [TranscriptSegment] {
-    let modelPath = try await ModelManager.ensureModel(config.model)
+    // Ctrl+C ends the run from here, not from the decode call. Everything between — fetching
+    // a model, fetching the VAD model, loading either — can take minutes, and until this is
+    // installed a SIGINT kills the process where it stands: the transcript file never gets
+    // closed, and nothing gets to say where the recording was left.
+    let abortFlag = AbortFlag()
+    let interrupts = InterruptGuard { abortFlag.raise() }
+    defer { interrupts.release() }
+
+    // Ctrl+C during a step that has no way of its own to notice one.
+    func checkAborted() throws {
+        guard abortFlag.isRaised else { return }
+        Log.status("Aborted before transcription started.")
+        throw RunAborted()
+    }
+
+    let isCancelled: @Sendable () -> Bool = { abortFlag.isRaised }
+
+    let modelPath = try await ModelManager.ensureModel(config.model, isCancelled: isCancelled)
 
     var options = TranscribeOptions(language: config.language, chunkLength: config.chunkLength)
     if config.vad {
-        options.vadModelPath = try await ModelManager.ensureModel(ModelManager.vadModel.name)
+        options.vadModelPath = try await ModelManager.ensureModel(
+            ModelManager.vadModel.name,
+            isCancelled: isCancelled
+        )
     }
+    try checkAborted()
 
     Log.status("Loading model: \(config.model)")
     let whisper = try WhisperContext(modelPath: modelPath)
 
+    // Loading is one blocking call, so a Ctrl+C during it can only land here.
+    try checkAborted()
+
+    // Whisper is asked to stop between graph computations rather than killed, so the
+    // segments already written stay written.
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
-    let segments = try whisper.transcribe(
-        samples: samples,
-        options: options,
-        showProgress: showProgress,
-        onSegment: onSegment
-    )
+    do {
+        let segments = try whisper.transcribe(
+            samples: samples,
+            options: options,
+            showProgress: showProgress,
+            isCancelled: isCancelled,
+            onSegment: onSegment
+        )
 
-    // The progress line is rewritten with \r, so close it before anything else writes to stderr.
-    if showProgress {
-        eprintln("")
+        // The progress line is rewritten with \r, so close it before anything else writes to stderr.
+        if showProgress {
+            eprintln("")
+        }
+
+        return segments
+    } catch is RunAborted {
+        if showProgress {
+            eprintln("")
+        }
+        Log.status("Aborted. Keeping the transcript decoded so far.")
+        throw RunAborted()
     }
+}
 
-    return segments
+extension ExitCode {
+    /// 128 + SIGINT, the shell's convention for a run ended by Ctrl+C.
+    static let interrupted = ExitCode(130)
 }
 
 // MARK: - Errors

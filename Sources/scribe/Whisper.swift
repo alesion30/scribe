@@ -59,10 +59,14 @@ final class WhisperContext {
     }
 
     /// Transcribe Float PCM samples (16 kHz mono), emitting each timestamped segment as it is decoded.
+    ///
+    /// - Parameter isCancelled: polled between chunks and from inside whisper.cpp, so Ctrl+C
+    ///   ends a long transcription instead of waiting it out. Throws `RunAborted` when it does.
     func transcribe(
         samples: [Float],
         options: TranscribeOptions = TranscribeOptions(),
         showProgress: Bool = false,
+        isCancelled: (() -> Bool)? = nil,
         onSegment: @escaping (TranscriptSegment) -> Void
     ) throws -> [TranscriptSegment] {
         let chunks = Self.chunks(sampleCount: samples.count, options: options)
@@ -70,8 +74,12 @@ final class WhisperContext {
             Log.info("Split into \(chunks.count) chunks of \(String(format: "%.0f", options.chunkLength))s")
         }
 
+        let cancel = isCancelled.map { CancelCheck($0) }
         let collector = SegmentCollector(onSegment: onSegment)
         for (index, chunk) in chunks.enumerated() {
+            if cancel?.shouldStop() == true {
+                throw RunAborted()
+            }
             collector.startChunk(
                 offset: TimeInterval(chunk.fed.lowerBound) / AudioWriter.sampleRate,
                 ownedStart: TimeInterval(chunk.owned.lowerBound) / AudioWriter.sampleRate
@@ -81,7 +89,8 @@ final class WhisperContext {
                 range: chunk.fed,
                 options: options,
                 collector: collector,
-                progress: showProgress ? ProgressReporter(chunkIndex: index, chunkCount: chunks.count) : nil
+                progress: showProgress ? ProgressReporter(chunkIndex: index, chunkCount: chunks.count) : nil,
+                cancel: cancel
             )
         }
 
@@ -97,7 +106,8 @@ final class WhisperContext {
         range: Range<Int>,
         options: TranscribeOptions,
         collector: SegmentCollector,
-        progress: ProgressReporter?
+        progress: ProgressReporter?,
+        cancel: CancelCheck?
     ) throws {
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
 
@@ -121,6 +131,16 @@ final class WhisperContext {
             params.progress_callback_user_data = progress.map { Unmanaged.passUnretained($0).toOpaque() }
         }
 
+        // whisper.cpp asks before every graph computation, which is the only place a
+        // blocking decode can be stopped without killing the process out from under it.
+        if let cancel {
+            params.abort_callback = { (userData: UnsafeMutableRawPointer?) -> Bool in
+                guard let userData else { return false }
+                return Unmanaged<CancelCheck>.fromOpaque(userData).takeUnretainedValue().shouldStop()
+            }
+            params.abort_callback_user_data = Unmanaged.passUnretained(cancel).toOpaque()
+        }
+
         params.new_segment_callback = { (ctx: OpaquePointer?, _: OpaquePointer?, newCount: Int32, userData: UnsafeMutableRawPointer?) in
             guard let ctx, let userData else { return }
             let collector = Unmanaged<SegmentCollector>.fromOpaque(userData).takeUnretainedValue()
@@ -138,7 +158,7 @@ final class WhisperContext {
         }
         params.new_segment_callback_user_data = Unmanaged.passUnretained(collector).toOpaque()
 
-        let result: Int32 = try withExtendedLifetime(progress) {
+        let result: Int32 = try withExtendedLifetime((progress, cancel)) {
             // whisper.cpp maps timestamps back to the original audio after dropping silence
             try Self.withOptionalCString(options.vadModelPath) { vadPtr in
                 if let vadPtr {
@@ -158,6 +178,11 @@ final class WhisperContext {
                     }
                 }
             }
+        }
+
+        // Checked before the return code: an aborted decode reports failure, and it isn't one.
+        if cancel?.shouldStop() == true {
+            throw RunAborted()
         }
 
         if result != 0 {
@@ -248,6 +273,19 @@ final class SegmentCollector {
         let placed = TranscriptSegment(start: start, end: end, text: segment.text)
         segments.append(placed)
         onSegment(placed)
+    }
+}
+
+/// Carries the cancel check into the abort callback, a C function pointer that cannot capture.
+final class CancelCheck {
+    private let isCancelled: () -> Bool
+
+    init(_ isCancelled: @escaping () -> Bool) {
+        self.isCancelled = isCancelled
+    }
+
+    func shouldStop() -> Bool {
+        isCancelled()
     }
 }
 
