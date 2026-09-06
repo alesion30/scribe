@@ -25,7 +25,7 @@ struct Scribe: AsyncParsableCommand {
             While recording, press q and confirm with y to stop and move on to the transcript. \
             Ctrl+C ends the whole run at any point, keeping the audio and the transcript written so far.
             """,
-        version: "0.2.2",
+        version: "0.2.3",
         subcommands: [
             DefaultCommand.self,
             Record.self,
