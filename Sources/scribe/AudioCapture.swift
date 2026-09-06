@@ -17,7 +17,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     let captureMic: Bool
     let captureSystem: Bool
 
-    /// How long to wait for ScreenCaptureKit to answer before treating it as a missing permission.
+    /// How long to wait for ScreenCaptureKit to answer before giving up on system audio.
     static let shareableContentTimeout: Duration = .seconds(10)
 
     private let paths: RecordingPaths
@@ -209,6 +209,13 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     // MARK: - System Audio (ScreenCaptureKit)
 
     private func startSystemAudioCapture() async throws {
+        // Asking ScreenCaptureKit without the grant shows the prompt and then hangs, so check first.
+        guard CGPreflightScreenCaptureAccess() else {
+            // Puts scribe's terminal in the settings list even if the prompt is dismissed.
+            CGRequestScreenCaptureAccess()
+            throw AudioCaptureError.screenRecordingPermissionDenied
+        }
+
         let content: SCShareableContent
         do {
             content = try await Self.shareableContent(timeout: Self.shareableContentTimeout)
@@ -312,14 +319,14 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
     // MARK: - Private
 
-    /// Ask ScreenCaptureKit what is shareable, giving up after `timeout`.
+    /// Ask ScreenCaptureKit for the displays, giving up after `timeout`.
     ///
-    /// Without the grant the call can hang forever instead of throwing, which used to leave
-    /// scribe waiting for a Ctrl+C while capturing nothing.
+    /// Only displays are needed, so the window list is kept as small as possible:
+    /// enumerating every off-screen window can take well over ten seconds on a busy Mac.
     private static func shareableContent(timeout: Duration) async throws -> SCShareableContent {
         try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
             group.addTask {
-                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
             }
             group.addTask {
                 try await Task.sleep(for: timeout)
@@ -498,12 +505,13 @@ enum AudioCaptureError: LocalizedError {
     case noDisplayFound
     case invalidMicrophoneFormat
     case unsupportedSourceFormat(String)
+    case screenRecordingPermissionDenied
     case screenRecordingUnavailable
 
-    /// A missing grant surfaces as either no display or no answer, so both point at the same fix.
+    /// A missing grant surfaces as a denied preflight or no display, so both point at the same fix.
     private static let screenRecordingHelp = """
         Open System Settings > Privacy & Security > Screen & System Audio Recording and enable access \
-        for your terminal application (e.g., Terminal, iTerm2).
+        for your terminal application (e.g., Terminal, iTerm2), then restart the terminal and run scribe again.
         To record without system audio, pass --no-system.
         """
 
@@ -518,10 +526,16 @@ enum AudioCaptureError: LocalizedError {
             return "Microphone returned an invalid audio format (sample rate is 0)"
         case .unsupportedSourceFormat(let label):
             return "\(label) audio format cannot be converted to 16 kHz mono"
+        case .screenRecordingPermissionDenied:
+            return """
+                Screen recording permission is not granted, so system audio cannot be captured.
+                \(Self.screenRecordingHelp)
+                """
         case .screenRecordingUnavailable:
             return """
-                ScreenCaptureKit did not respond, which usually means screen recording permission is missing.
-                \(Self.screenRecordingHelp)
+                ScreenCaptureKit did not respond in time, so system audio cannot be captured.
+                If you just granted screen recording permission, restart the terminal and try again.
+                To record without system audio, pass --no-system.
                 """
         }
     }
